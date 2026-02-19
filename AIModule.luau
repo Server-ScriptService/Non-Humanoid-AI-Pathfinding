@@ -27,6 +27,8 @@ local DEFAULT_FAILURE_COST_INCREASE = 0.15
 local DEFAULT_EXPLORATION_SECONDS = 3
 local DEFAULT_EXPLORATION_ANGLE = 35
 
+local NextAgentId = 0
+
 local DataStore = nil
 pcall(function()
 	DataStore = DataStoreService:GetDataStore(DATASTORE_NAME)
@@ -282,6 +284,48 @@ local function BuildRaycastParams(RootPart, Params)
 	return RaycastParamsValue
 end
 
+local function ProbeOffsets(Clearance)
+	local SafeClearance = math.max(0.1, Clearance)
+	return {
+		0,
+		-SafeClearance,
+		SafeClearance,
+		-SafeClearance * 0.5,
+		SafeClearance * 0.5,
+	}
+end
+
+local function IsDirectionClear(StartPosition, Direction, RootPart, Params, Height, Clearance)
+	if Direction.Magnitude <= 0.001 then
+		return true
+	end
+
+	local RaycastParamsValue = BuildRaycastParams(RootPart, Params)
+	local ProbeStart = StartPosition + Vector3.new(0, Height, 0)
+	local HorizontalDirection = Vector3.new(Direction.X, 0, Direction.Z)
+	if HorizontalDirection.Magnitude <= 0.001 then
+		local Hit = Workspace:Raycast(ProbeStart, Direction, RaycastParamsValue)
+		if Params and Params.DebugRays then
+			DrawDebugRay(ProbeStart, Direction, Hit ~= nil)
+		end
+		return Hit == nil
+	end
+
+	local Right = HorizontalDirection.Unit:Cross(Vector3.new(0, 1, 0)).Unit
+	for _, Offset in ipairs(ProbeOffsets(Clearance)) do
+		local OffsetStart = ProbeStart + Right * Offset
+		local Hit = Workspace:Raycast(OffsetStart, Direction, RaycastParamsValue)
+		if Params and Params.DebugRays then
+			DrawDebugRay(OffsetStart, Direction, Hit ~= nil)
+		end
+		if Hit then
+			return false
+		end
+	end
+
+	return true
+end
+
 local function DrawDebugRay(StartPosition, Direction, IsHit)
 	local Marker = Instance.new("Part")
 	Marker.Anchored = true
@@ -377,7 +421,7 @@ local function ReconstructPath(CameFrom, CurrentNode, CellSize, Height)
 end
 
 -- Layer 3 uses A* over a learned top-down grid. Costs come from learned edge/cell stats.
-local function ComputeLearnedPath(StartPosition, GoalPosition, Height, Params)
+local function ComputeLearnedPath(StartPosition, GoalPosition, Height, RootPart, Clearance, Params)
 	local CellSize = GetCellSize(Params)
 	local StartX, StartZ = ToCell(StartPosition, CellSize)
 	local GoalX, GoalZ = ToCell(GoalPosition, CellSize)
@@ -423,6 +467,11 @@ local function ComputeLearnedPath(StartPosition, GoalPosition, Height, Params)
 			local NextZ = CurZ + Offset[2]
 			local Neighbor = CellKey(NextX, NextZ)
 			if not ClosedSet[Neighbor] then
+				local StepStart = CellToCenter(CurX, CurZ, CellSize, Height)
+				local StepGoal = CellToCenter(NextX, NextZ, CellSize, Height)
+				if not IsDirectionClear(StepStart, StepGoal - StepStart, RootPart, Params, 0, Clearance) then
+					continue
+				end
 				local BaseDistance = (Vector2.new(CurX, CurZ) - Vector2.new(NextX, NextZ)).Magnitude
 				local StepCost, BlockedConfidence = TraversalCost(CurX, CurZ, NextX, NextZ, BaseDistance, Params)
 				local SkipThreshold = GetParams(Params, "BlockedSkipConfidence", DEFAULT_BLOCKED_SKIP_CONFIDENCE)
@@ -457,7 +506,6 @@ local function ComputeLearnedPath(StartPosition, GoalPosition, Height, Params)
 end
 
 local function TryLocalAvoidance(StartPosition, DesiredDirection, Clearance, RootPart, Params, Height)
-	local RaycastParamsValue = BuildRaycastParams(RootPart, Params)
 	local Range = GetParams(Params, "LocalAvoidanceRange", DEFAULT_LOCAL_AVOIDANCE_RANGE)
 	local Angles = {-70, -40, -20, 20, 40, 70}
 	local ExplorationAngle = 0
@@ -468,12 +516,7 @@ local function TryLocalAvoidance(StartPosition, DesiredDirection, Clearance, Roo
 		local Angle = math.rad(Degrees + ExplorationAngle)
 		local Rotated = (CFrame.fromAxisAngle(Vector3.new(0, 1, 0), Angle):VectorToWorldSpace(DesiredDirection.Unit))
 		local ProbeDirection = Rotated * (Range + Clearance)
-		local ProbeStart = StartPosition + Vector3.new(0, Height, 0)
-		local Hit = Workspace:Raycast(ProbeStart, ProbeDirection, RaycastParamsValue)
-		if Params and Params.DebugRays then
-			DrawDebugRay(ProbeStart, ProbeDirection, Hit ~= nil)
-		end
-		if not Hit then
+		if IsDirectionClear(StartPosition, ProbeDirection, RootPart, Params, Height, Clearance) then
 			return Rotated
 		end
 	end
@@ -481,14 +524,10 @@ local function TryLocalAvoidance(StartPosition, DesiredDirection, Clearance, Roo
 end
 
 local function IsLineClear(StartPosition, EndPosition, RootPart, Params, Height)
-	local RaycastParamsValue = BuildRaycastParams(RootPart, Params)
 	local Direction = EndPosition - StartPosition
-	local ProbeStart = StartPosition + Vector3.new(0, Height, 0)
-	local Hit = Workspace:Raycast(ProbeStart, Direction, RaycastParamsValue)
-	if Params and Params.DebugRays then
-		DrawDebugRay(ProbeStart, Direction, Hit ~= nil)
-	end
-	return Hit == nil
+	local RootSize = RootPart.Size
+	local Clearance = math.max(RootSize.X, RootSize.Z) * 0.5
+	return IsDirectionClear(StartPosition, Direction, RootPart, Params, Height, Clearance)
 end
 
 local function Horizontal(Vector)
@@ -506,7 +545,12 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 		return false, "Invalid Destination"
 	end
 
-	local AgentId = RootPart:GetDebugId(1)
+	local AgentId = RootPart:GetAttribute("NavAgentId")
+	if type(AgentId) ~= "string" or AgentId == "" then
+		NextAgentId += 1
+		AgentId = string.format("NavAgent-%d", NextAgentId)
+		RootPart:SetAttribute("NavAgentId", AgentId)
+	end
 	local AgentState = RuntimeState.AgentStates[AgentId]
 	if not AgentState then
 		AgentState = {
@@ -609,7 +653,7 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 		else
 			local RerouteCooldown = GetParams(Params, "RerouteCooldown", DEFAULT_REROUTE_COOLDOWN)
 			if not AgentState.Path or IsStuck or (Now - AgentState.LastReroute >= RerouteCooldown) then
-				local Path = ComputeLearnedPath(CurrentPosition, Destination, CurrentPosition.Y, Params)
+				local Path = ComputeLearnedPath(CurrentPosition, Destination, CurrentPosition.Y, RootPart, Clearance, Params)
 				AgentState.Path = Path
 				AgentState.PathIndex = 1
 				AgentState.LastReroute = Now
@@ -631,7 +675,11 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 	end
 
 	if DesiredVelocityXZ.Magnitude <= 0.001 then
-		DesiredVelocityXZ = HorizontalToDestination.Unit * Walkspeed * 0.45
+		if HasLOS and HorizontalToDestination.Magnitude > 0.001 then
+			DesiredVelocityXZ = HorizontalToDestination.Unit * Walkspeed * 0.45
+		else
+			DesiredVelocityXZ = Vector3.zero
+		end
 	end
 
 	RootPart.AssemblyLinearVelocity = Vector3.new(DesiredVelocityXZ.X, ExistingVelocity.Y, DesiredVelocityXZ.Z)
