@@ -29,6 +29,8 @@ local DEFAULT_EXPLORATION_ANGLE = 35
 local DEFAULT_GAP_ATTEMPT_SECONDS = 1
 local DEFAULT_GAP_CLEARANCE_SCALE = 0.6
 local DEFAULT_LOCAL_AVOIDANCE_SUPPRESS_SECONDS = 0.85
+local DEFAULT_MAX_PATH_TRIES = 3
+local DEFAULT_PATH_RETRY_EXPANSION_MULTIPLIER = 1.65
 
 local DataStore = nil
 pcall(function()
@@ -363,20 +365,59 @@ local function TraversalCost(FromX, FromZ, ToX, ToZ, DistanceCost, Params)
 	return DistanceCost * FailurePenalty * TimePenalty * BiasPenalty, BlockedConfidence
 end
 
-local function MinOpenSet(OpenSet, FScore)
-	local BestIndex = 1
-	local BestNode = OpenSet[1]
-	local BestF = FScore[BestNode] or math.huge
-	for Index = 2, #OpenSet do
-		local Node = OpenSet[Index]
-		local Score = FScore[Node] or math.huge
-		if Score < BestF then
-			BestF = Score
-			BestNode = Node
-			BestIndex = Index
+local function MergeParams(Params, Overrides)
+	local Merged = {}
+	if type(Params) == "table" then
+		for Key, Value in pairs(Params) do
+			Merged[Key] = Value
 		end
 	end
-	return BestIndex, BestNode
+	for Key, Value in pairs(Overrides) do
+		Merged[Key] = Value
+	end
+	return Merged
+end
+
+local function HeapPush(Heap, Node, Priority)
+	table.insert(Heap, {Node = Node, Priority = Priority})
+	local Index = #Heap
+	while Index > 1 do
+		local Parent = math.floor(Index / 2)
+		if Heap[Parent].Priority <= Heap[Index].Priority then
+			break
+		end
+		Heap[Parent], Heap[Index] = Heap[Index], Heap[Parent]
+		Index = Parent
+	end
+end
+
+local function HeapPop(Heap)
+	if #Heap == 0 then
+		return nil
+	end
+	local Top = Heap[1]
+	local Last = table.remove(Heap)
+	if #Heap > 0 then
+		Heap[1] = Last
+		local Index = 1
+		while true do
+			local Left = Index * 2
+			local Right = Left + 1
+			local Smallest = Index
+			if Left <= #Heap and Heap[Left].Priority < Heap[Smallest].Priority then
+				Smallest = Left
+			end
+			if Right <= #Heap and Heap[Right].Priority < Heap[Smallest].Priority then
+				Smallest = Right
+			end
+			if Smallest == Index then
+				break
+			end
+			Heap[Index], Heap[Smallest] = Heap[Smallest], Heap[Index]
+			Index = Smallest
+		end
+	end
+	return Top
 end
 
 local function ReconstructPath(CameFrom, CurrentNode, CellSize, Height)
@@ -401,7 +442,7 @@ local function ComputeLearnedPath(StartPosition, GoalPosition, Height, Params)
 
 	local StartNode = CellKey(StartX, StartZ)
 	local GoalNode = CellKey(GoalX, GoalZ)
-	local OpenSet = {StartNode}
+	local OpenHeap = {}
 	local CameFrom = {}
 	local GScore = {[StartNode] = 0}
 	local FScore = {[StartNode] = (Vector2.new(StartX, StartZ) - Vector2.new(GoalX, GoalZ)).Magnitude}
@@ -416,10 +457,21 @@ local function ComputeLearnedPath(StartPosition, GoalPosition, Height, Params)
 		{1, 0}, {-1, 0}, {0, 1}, {0, -1},
 	}
 
+	HeapPush(OpenHeap, StartNode, FScore[StartNode])
+
 	local Expansions = 0
-	while #OpenSet > 0 do
-		local BestIndex, Current = MinOpenSet(OpenSet, FScore)
-		table.remove(OpenSet, BestIndex)
+	while #OpenHeap > 0 do
+		local NextOpen = HeapPop(OpenHeap)
+		if not NextOpen then
+			break
+		end
+		local Current = NextOpen.Node
+		if ClosedSet[Current] then
+			continue
+		end
+		if (FScore[Current] or math.huge) < NextOpen.Priority - 0.0001 then
+			continue
+		end
 		if Current == GoalNode then
 			local Path = ReconstructPath(CameFrom, Current, CellSize, Height)
 			if #Path > 0 then
@@ -446,17 +498,9 @@ local function ComputeLearnedPath(StartPosition, GoalPosition, Height, Params)
 					if TentativeG < (GScore[Neighbor] or math.huge) then
 						CameFrom[Neighbor] = Current
 						GScore[Neighbor] = TentativeG
-						FScore[Neighbor] = TentativeG + (Vector2.new(NextX, NextZ) - Vector2.new(GoalX, GoalZ)).Magnitude
-						local Seen = false
-						for _, Existing in ipairs(OpenSet) do
-							if Existing == Neighbor then
-								Seen = true
-								break
-							end
-						end
-						if not Seen then
-							table.insert(OpenSet, Neighbor)
-						end
+						local Heuristic = (Vector2.new(NextX, NextZ) - Vector2.new(GoalX, GoalZ)).Magnitude
+						FScore[Neighbor] = TentativeG + Heuristic
+						HeapPush(OpenHeap, Neighbor, FScore[Neighbor])
 					end
 				end
 			end
@@ -469,6 +513,26 @@ local function ComputeLearnedPath(StartPosition, GoalPosition, Height, Params)
 	end
 
 	return nil
+end
+
+local function ComputeLearnedPathWithRetries(StartPosition, GoalPosition, Height, Params)
+	local MaxPathTries = math.max(1, GetParams(Params, "MaxPathTries", DEFAULT_MAX_PATH_TRIES))
+	local ExpansionMultiplier = math.max(1.1, GetParams(Params, "PathRetryExpansionMultiplier", DEFAULT_PATH_RETRY_EXPANSION_MULTIPLIER))
+	local BaseExpansionCap = GetParams(Params, "NodeExpansionCap", DEFAULT_NODE_EXPANSION_CAP)
+	local BaseBlockedSkipConfidence = GetParams(Params, "BlockedSkipConfidence", DEFAULT_BLOCKED_SKIP_CONFIDENCE)
+
+	for Attempt = 1, MaxPathTries do
+		local AttemptParams = MergeParams(Params, {
+			NodeExpansionCap = math.floor(BaseExpansionCap * math.pow(ExpansionMultiplier, Attempt - 1)),
+			BlockedSkipConfidence = math.min(0.995, BaseBlockedSkipConfidence + (Attempt - 1) * 0.03),
+		})
+		local Path = ComputeLearnedPath(StartPosition, GoalPosition, Height, AttemptParams)
+		if Path and #Path > 0 then
+			return Path, Attempt
+		end
+	end
+
+	return nil, MaxPathTries
 end
 
 local function IsDirectionClearWithClearance(ProbeStart, ProbeDirection, RaycastParamsValue, Clearance, DebugRays)
@@ -597,6 +661,8 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 			LocalAttemptDirection = nil,
 			LocalAttemptStartedAt = 0,
 			SuppressLocalAvoidanceUntil = 0,
+			LastPathSignature = "",
+			LastPathTriesUsed = 0,
 		}
 		RuntimeState.AgentStates[AgentId] = AgentState
 	end
@@ -711,11 +777,20 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 
 		if DesiredVelocityXZ.Magnitude <= 0.001 then
 			local RerouteCooldown = GetParams(Params, "RerouteCooldown", DEFAULT_REROUTE_COOLDOWN)
+			local CurrentCellKey = CellKey(CurrentCellX, CurrentCellZ)
+			local GoalCellX, GoalCellZ = ToCell(Destination, CellSize)
+			local GoalCellKey = CellKey(GoalCellX, GoalCellZ)
+			local PathSignature = CurrentCellKey .. "->" .. GoalCellKey
 			if not AgentState.Path or IsStuck or ForceReroute or (Now - AgentState.LastReroute >= RerouteCooldown) then
-				local Path = ComputeLearnedPath(CurrentPosition, Destination, CurrentPosition.Y, Params)
+				if PathSignature ~= AgentState.LastPathSignature then
+					AgentState.LastPathTriesUsed = 0
+				end
+				local Path, TriesUsed = ComputeLearnedPathWithRetries(CurrentPosition, Destination, CurrentPosition.Y, Params)
 				AgentState.Path = Path
 				AgentState.PathIndex = 1
 				AgentState.LastReroute = Now
+				AgentState.LastPathSignature = PathSignature
+				AgentState.LastPathTriesUsed = TriesUsed
 				if Params and Params.DebugPath and Path then
 					DrawDebugPath(Path, CurrentPosition.Y)
 				end
