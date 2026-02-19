@@ -26,9 +26,6 @@ local DEFAULT_SUCCESS_COST_DECAY = 0.03
 local DEFAULT_FAILURE_COST_INCREASE = 0.15
 local DEFAULT_EXPLORATION_SECONDS = 3
 local DEFAULT_EXPLORATION_ANGLE = 35
-local DEFAULT_AVOIDANCE_LOCK_SECONDS = 0.45
-
-local NextAgentId = 0
 
 local DataStore = nil
 pcall(function()
@@ -54,6 +51,18 @@ local function GetRootPart(AI)
 		return AI.PrimaryPart
 	end
 	return nil
+end
+
+local function GetAgentId(RootPart)
+	local Existing = RootPart:GetAttribute("NavAgentId")
+	if type(Existing) == "string" and #Existing > 0 then
+		return Existing
+	end
+	local NewId = HttpService:GenerateGUID(false)
+	pcall(function()
+		RootPart:SetAttribute("NavAgentId", NewId)
+	end)
+	return NewId
 end
 
 local function GetNow()
@@ -285,48 +294,6 @@ local function BuildRaycastParams(RootPart, Params)
 	return RaycastParamsValue
 end
 
-local function ProbeOffsets(Clearance)
-	local SafeClearance = math.max(0.1, Clearance)
-	return {
-		0,
-		-SafeClearance,
-		SafeClearance,
-		-SafeClearance * 0.5,
-		SafeClearance * 0.5,
-	}
-end
-
-local function IsDirectionClear(StartPosition, Direction, RootPart, Params, Height, Clearance)
-	if Direction.Magnitude <= 0.001 then
-		return true
-	end
-
-	local RaycastParamsValue = BuildRaycastParams(RootPart, Params)
-	local ProbeStart = StartPosition + Vector3.new(0, Height, 0)
-	local HorizontalDirection = Vector3.new(Direction.X, 0, Direction.Z)
-	if HorizontalDirection.Magnitude <= 0.001 then
-		local Hit = Workspace:Raycast(ProbeStart, Direction, RaycastParamsValue)
-		if Params and Params.DebugRays then
-			DrawDebugRay(ProbeStart, Direction, Hit ~= nil)
-		end
-		return Hit == nil
-	end
-
-	local Right = HorizontalDirection.Unit:Cross(Vector3.new(0, 1, 0)).Unit
-	for _, Offset in ipairs(ProbeOffsets(Clearance)) do
-		local OffsetStart = ProbeStart + Right * Offset
-		local Hit = Workspace:Raycast(OffsetStart, Direction, RaycastParamsValue)
-		if Params and Params.DebugRays then
-			DrawDebugRay(OffsetStart, Direction, Hit ~= nil)
-		end
-		if Hit then
-			return false
-		end
-	end
-
-	return true
-end
-
 local function DrawDebugRay(StartPosition, Direction, IsHit)
 	local Marker = Instance.new("Part")
 	Marker.Anchored = true
@@ -422,7 +389,7 @@ local function ReconstructPath(CameFrom, CurrentNode, CellSize, Height)
 end
 
 -- Layer 3 uses A* over a learned top-down grid. Costs come from learned edge/cell stats.
-local function ComputeLearnedPath(StartPosition, GoalPosition, Height, RootPart, Clearance, Params)
+local function ComputeLearnedPath(StartPosition, GoalPosition, Height, Params)
 	local CellSize = GetCellSize(Params)
 	local StartX, StartZ = ToCell(StartPosition, CellSize)
 	local GoalX, GoalZ = ToCell(GoalPosition, CellSize)
@@ -468,11 +435,6 @@ local function ComputeLearnedPath(StartPosition, GoalPosition, Height, RootPart,
 			local NextZ = CurZ + Offset[2]
 			local Neighbor = CellKey(NextX, NextZ)
 			if not ClosedSet[Neighbor] then
-				local StepStart = CellToCenter(CurX, CurZ, CellSize, Height)
-				local StepGoal = CellToCenter(NextX, NextZ, CellSize, Height)
-				if not IsDirectionClear(StepStart, StepGoal - StepStart, RootPart, Params, 0, Clearance) then
-					continue
-				end
 				local BaseDistance = (Vector2.new(CurX, CurZ) - Vector2.new(NextX, NextZ)).Magnitude
 				local StepCost, BlockedConfidence = TraversalCost(CurX, CurZ, NextX, NextZ, BaseDistance, Params)
 				local SkipThreshold = GetParams(Params, "BlockedSkipConfidence", DEFAULT_BLOCKED_SKIP_CONFIDENCE)
@@ -506,41 +468,85 @@ local function ComputeLearnedPath(StartPosition, GoalPosition, Height, RootPart,
 	return nil
 end
 
-local function TryLocalAvoidance(StartPosition, DesiredDirection, Clearance, RootPart, Params, Height, PreferredSide)
-	local Range = GetParams(Params, "LocalAvoidanceRange", DEFAULT_LOCAL_AVOIDANCE_RANGE)
-	local AngleOffsets = {20, 40, 70}
-	local Angles = {}
-	if PreferredSide and PreferredSide > 0 then
-		for _, Offset in ipairs(AngleOffsets) do
-			table.insert(Angles, Offset)
-			table.insert(Angles, -Offset)
+local function IsDirectionClearWithClearance(ProbeStart, ProbeDirection, RaycastParamsValue, Clearance, DebugRays)
+	local Length = ProbeDirection.Magnitude
+	if Length <= 0.001 then
+		return true
+	end
+	local UnitDir = ProbeDirection / Length
+	local Perp = Vector3.new(-UnitDir.Z, 0, UnitDir.X)
+	local SideOffset = Perp * math.max(0.15, Clearance * 0.85)
+
+	local Starts = {
+		ProbeStart,
+		ProbeStart + SideOffset,
+		ProbeStart - SideOffset,
+	}
+
+	for _, Start in ipairs(Starts) do
+		local Hit = Workspace:Raycast(Start, ProbeDirection, RaycastParamsValue)
+		if DebugRays then
+			DrawDebugRay(Start, ProbeDirection, Hit ~= nil)
 		end
-	else
-		for _, Offset in ipairs(AngleOffsets) do
-			table.insert(Angles, -Offset)
-			table.insert(Angles, Offset)
+		if Hit then
+			return false
 		end
 	end
+
+	return true
+end
+
+local function TryLocalAvoidance(StartPosition, DesiredDirection, Clearance, RootPart, Params, Height)
+	local RaycastParamsValue = BuildRaycastParams(RootPart, Params)
+	local Range = GetParams(Params, "LocalAvoidanceRange", DEFAULT_LOCAL_AVOIDANCE_RANGE)
+	local Angles = {-70, -40, -20, 20, 40, 70}
 	local ExplorationAngle = 0
 	if Params and Params.ExplorationBiasAngle then
 		ExplorationAngle = Params.ExplorationBiasAngle
 	end
+
+	local RootSize = RootPart.Size
+	local LowHeight = math.max(0.5, RootSize.Y * 0.25)
+	local DebugRays = Params and Params.DebugRays
+
 	for _, Degrees in ipairs(Angles) do
 		local Angle = math.rad(Degrees + ExplorationAngle)
 		local Rotated = (CFrame.fromAxisAngle(Vector3.new(0, 1, 0), Angle):VectorToWorldSpace(DesiredDirection.Unit))
 		local ProbeDirection = Rotated * (Range + Clearance)
-		if IsDirectionClear(StartPosition, ProbeDirection, RootPart, Params, Height, Clearance) then
-			return Rotated, Degrees >= 0 and 1 or -1
+
+		local ProbeStartHigh = StartPosition + Vector3.new(0, Height, 0)
+		local ProbeStartLow = StartPosition + Vector3.new(0, LowHeight, 0)
+
+		local HighClear = IsDirectionClearWithClearance(ProbeStartHigh, ProbeDirection, RaycastParamsValue, Clearance, DebugRays)
+		local LowClear = IsDirectionClearWithClearance(ProbeStartLow, ProbeDirection, RaycastParamsValue, Clearance, DebugRays)
+
+		if HighClear and LowClear then
+			return Rotated
 		end
 	end
-	return nil, nil
+	return nil
 end
 
 local function IsLineClear(StartPosition, EndPosition, RootPart, Params, Height)
+	local RaycastParamsValue = BuildRaycastParams(RootPart, Params)
 	local Direction = EndPosition - StartPosition
+
 	local RootSize = RootPart.Size
 	local Clearance = math.max(RootSize.X, RootSize.Z) * 0.5
-	return IsDirectionClear(StartPosition, Direction, RootPart, Params, Height, Clearance)
+	local LowHeight = math.max(0.5, RootSize.Y * 0.25)
+
+	local DebugRays = Params and Params.DebugRays
+	local ProbeStartHigh = StartPosition + Vector3.new(0, Height, 0)
+	local ProbeStartLow = StartPosition + Vector3.new(0, LowHeight, 0)
+
+	if not IsDirectionClearWithClearance(ProbeStartHigh, Direction, RaycastParamsValue, Clearance, DebugRays) then
+		return false
+	end
+	if not IsDirectionClearWithClearance(ProbeStartLow, Direction, RaycastParamsValue, Clearance, DebugRays) then
+		return false
+	end
+
+	return true
 end
 
 local function Horizontal(Vector)
@@ -558,12 +564,7 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 		return false, "Invalid Destination"
 	end
 
-	local AgentId = RootPart:GetAttribute("NavAgentId")
-	if type(AgentId) ~= "string" or AgentId == "" then
-		NextAgentId += 1
-		AgentId = string.format("NavAgent-%d", NextAgentId)
-		RootPart:SetAttribute("NavAgentId", AgentId)
-	end
+	local AgentId = GetAgentId(RootPart)
 	local AgentState = RuntimeState.AgentStates[AgentId]
 	if not AgentState then
 		AgentState = {
@@ -578,9 +579,6 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 			LastCellTransition = GetNow(),
 			StuckEvents = 0,
 			ExplorationUntil = 0,
-			AvoidanceDirection = nil,
-			AvoidanceUntil = 0,
-			AvoidanceSide = -1,
 		}
 		RuntimeState.AgentStates[AgentId] = AgentState
 	end
@@ -593,7 +591,7 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 	local ToDestination = Destination - CurrentPosition
 	local HorizontalToDestination = Horizontal(ToDestination)
 	local Distance = HorizontalToDestination.Magnitude
-	if Distance < 4 then
+	if Distance < 1.5 then
 		local ExistingVelocity = RootPart.AssemblyLinearVelocity
 		RootPart.AssemblyLinearVelocity = Vector3.new(0, ExistingVelocity.Y, 0)
 		return true, "Arrived"
@@ -650,8 +648,6 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 		DesiredVelocityXZ = HorizontalToDestination.Unit * Walkspeed
 		AgentState.Path = nil
 		AgentState.PathIndex = 1
-		AgentState.AvoidanceDirection = nil
-		AgentState.AvoidanceUntil = 0
 	else
 		local ExplorationBiasAngle = 0
 		if Now < AgentState.ExplorationUntil then
@@ -659,40 +655,19 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 			ExplorationBiasAngle = (math.random() * 2 - 1) * ExplorationAngle
 		end
 
-		local AvoidanceDirection = nil
-		if AgentState.AvoidanceDirection and Now < AgentState.AvoidanceUntil then
-			local ExistingProbe = AgentState.AvoidanceDirection * (GetParams(Params, "LocalAvoidanceRange", DEFAULT_LOCAL_AVOIDANCE_RANGE) + Clearance)
-			if IsDirectionClear(CurrentPosition, ExistingProbe, RootPart, Params, ProbeHeight, Clearance) then
-				AvoidanceDirection = AgentState.AvoidanceDirection
-			else
-				AgentState.AvoidanceDirection = nil
-				AgentState.AvoidanceUntil = 0
-			end
-		end
-
-		if not AvoidanceDirection then
-			local NewDirection, Side = TryLocalAvoidance(CurrentPosition, HorizontalToDestination, Clearance, RootPart, {
-				DebugRays = Params and Params.DebugRays,
-				RaycastIgnore = Params and Params.RaycastIgnore,
-				LocalAvoidanceRange = GetParams(Params, "LocalAvoidanceRange", DEFAULT_LOCAL_AVOIDANCE_RANGE),
-				ExplorationBiasAngle = ExplorationBiasAngle,
-			}, ProbeHeight, AgentState.AvoidanceSide)
-			if NewDirection then
-				AvoidanceDirection = NewDirection
-				AgentState.AvoidanceDirection = NewDirection
-				AgentState.AvoidanceSide = Side or AgentState.AvoidanceSide
-				AgentState.AvoidanceUntil = Now + GetParams(Params, "AvoidanceLockSeconds", DEFAULT_AVOIDANCE_LOCK_SECONDS)
-			end
-		end
+		local AvoidanceDirection = TryLocalAvoidance(CurrentPosition, HorizontalToDestination, Clearance, RootPart, {
+			DebugRays = Params and Params.DebugRays,
+			RaycastIgnore = Params and Params.RaycastIgnore,
+			LocalAvoidanceRange = GetParams(Params, "LocalAvoidanceRange", DEFAULT_LOCAL_AVOIDANCE_RANGE),
+			ExplorationBiasAngle = ExplorationBiasAngle,
+		}, ProbeHeight)
 
 		if AvoidanceDirection then
 			DesiredVelocityXZ = Horizontal(AvoidanceDirection).Unit * Walkspeed
 		else
-			AgentState.AvoidanceDirection = nil
-			AgentState.AvoidanceUntil = 0
 			local RerouteCooldown = GetParams(Params, "RerouteCooldown", DEFAULT_REROUTE_COOLDOWN)
 			if not AgentState.Path or IsStuck or (Now - AgentState.LastReroute >= RerouteCooldown) then
-				local Path = ComputeLearnedPath(CurrentPosition, Destination, CurrentPosition.Y, RootPart, Clearance, Params)
+				local Path = ComputeLearnedPath(CurrentPosition, Destination, CurrentPosition.Y, Params)
 				AgentState.Path = Path
 				AgentState.PathIndex = 1
 				AgentState.LastReroute = Now
@@ -707,18 +682,19 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 				if ToWaypoint.Magnitude < math.max(2, CellSize * 0.35) then
 					AgentState.PathIndex += 1
 				else
-					DesiredVelocityXZ = ToWaypoint.Unit * Walkspeed
+					if IsLineClear(CurrentPosition, Waypoint, RootPart, Params, ProbeHeight) then
+						DesiredVelocityXZ = ToWaypoint.Unit * Walkspeed
+					else
+						AgentState.Path = nil
+						AgentState.PathIndex = 1
+					end
 				end
 			end
 		end
 	end
 
 	if DesiredVelocityXZ.Magnitude <= 0.001 then
-		if HasLOS and HorizontalToDestination.Magnitude > 0.001 then
-			DesiredVelocityXZ = HorizontalToDestination.Unit * Walkspeed * 0.45
-		else
-			DesiredVelocityXZ = Vector3.zero
-		end
+		DesiredVelocityXZ = Vector3.zero
 	end
 
 	RootPart.AssemblyLinearVelocity = Vector3.new(DesiredVelocityXZ.X, ExistingVelocity.Y, DesiredVelocityXZ.Z)
@@ -738,5 +714,4 @@ end
 game:BindToClose(function()
 	FlushDataStore(true)
 end)
-
 return AIModule
