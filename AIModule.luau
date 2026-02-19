@@ -26,6 +26,7 @@ local DEFAULT_SUCCESS_COST_DECAY = 0.03
 local DEFAULT_FAILURE_COST_INCREASE = 0.15
 local DEFAULT_EXPLORATION_SECONDS = 3
 local DEFAULT_EXPLORATION_ANGLE = 35
+local DEFAULT_AVOIDANCE_LOCK_SECONDS = 0.45
 
 local NextAgentId = 0
 
@@ -505,9 +506,21 @@ local function ComputeLearnedPath(StartPosition, GoalPosition, Height, RootPart,
 	return nil
 end
 
-local function TryLocalAvoidance(StartPosition, DesiredDirection, Clearance, RootPart, Params, Height)
+local function TryLocalAvoidance(StartPosition, DesiredDirection, Clearance, RootPart, Params, Height, PreferredSide)
 	local Range = GetParams(Params, "LocalAvoidanceRange", DEFAULT_LOCAL_AVOIDANCE_RANGE)
-	local Angles = {-70, -40, -20, 20, 40, 70}
+	local AngleOffsets = {20, 40, 70}
+	local Angles = {}
+	if PreferredSide and PreferredSide > 0 then
+		for _, Offset in ipairs(AngleOffsets) do
+			table.insert(Angles, Offset)
+			table.insert(Angles, -Offset)
+		end
+	else
+		for _, Offset in ipairs(AngleOffsets) do
+			table.insert(Angles, -Offset)
+			table.insert(Angles, Offset)
+		end
+	end
 	local ExplorationAngle = 0
 	if Params and Params.ExplorationBiasAngle then
 		ExplorationAngle = Params.ExplorationBiasAngle
@@ -517,10 +530,10 @@ local function TryLocalAvoidance(StartPosition, DesiredDirection, Clearance, Roo
 		local Rotated = (CFrame.fromAxisAngle(Vector3.new(0, 1, 0), Angle):VectorToWorldSpace(DesiredDirection.Unit))
 		local ProbeDirection = Rotated * (Range + Clearance)
 		if IsDirectionClear(StartPosition, ProbeDirection, RootPart, Params, Height, Clearance) then
-			return Rotated
+			return Rotated, Degrees >= 0 and 1 or -1
 		end
 	end
-	return nil
+	return nil, nil
 end
 
 local function IsLineClear(StartPosition, EndPosition, RootPart, Params, Height)
@@ -565,6 +578,9 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 			LastCellTransition = GetNow(),
 			StuckEvents = 0,
 			ExplorationUntil = 0,
+			AvoidanceDirection = nil,
+			AvoidanceUntil = 0,
+			AvoidanceSide = -1,
 		}
 		RuntimeState.AgentStates[AgentId] = AgentState
 	end
@@ -634,6 +650,8 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 		DesiredVelocityXZ = HorizontalToDestination.Unit * Walkspeed
 		AgentState.Path = nil
 		AgentState.PathIndex = 1
+		AgentState.AvoidanceDirection = nil
+		AgentState.AvoidanceUntil = 0
 	else
 		local ExplorationBiasAngle = 0
 		if Now < AgentState.ExplorationUntil then
@@ -641,16 +659,37 @@ function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 			ExplorationBiasAngle = (math.random() * 2 - 1) * ExplorationAngle
 		end
 
-		local AvoidanceDirection = TryLocalAvoidance(CurrentPosition, HorizontalToDestination, Clearance, RootPart, {
-			DebugRays = Params and Params.DebugRays,
-			RaycastIgnore = Params and Params.RaycastIgnore,
-			LocalAvoidanceRange = GetParams(Params, "LocalAvoidanceRange", DEFAULT_LOCAL_AVOIDANCE_RANGE),
-			ExplorationBiasAngle = ExplorationBiasAngle,
-		}, ProbeHeight)
+		local AvoidanceDirection = nil
+		if AgentState.AvoidanceDirection and Now < AgentState.AvoidanceUntil then
+			local ExistingProbe = AgentState.AvoidanceDirection * (GetParams(Params, "LocalAvoidanceRange", DEFAULT_LOCAL_AVOIDANCE_RANGE) + Clearance)
+			if IsDirectionClear(CurrentPosition, ExistingProbe, RootPart, Params, ProbeHeight, Clearance) then
+				AvoidanceDirection = AgentState.AvoidanceDirection
+			else
+				AgentState.AvoidanceDirection = nil
+				AgentState.AvoidanceUntil = 0
+			end
+		end
+
+		if not AvoidanceDirection then
+			local NewDirection, Side = TryLocalAvoidance(CurrentPosition, HorizontalToDestination, Clearance, RootPart, {
+				DebugRays = Params and Params.DebugRays,
+				RaycastIgnore = Params and Params.RaycastIgnore,
+				LocalAvoidanceRange = GetParams(Params, "LocalAvoidanceRange", DEFAULT_LOCAL_AVOIDANCE_RANGE),
+				ExplorationBiasAngle = ExplorationBiasAngle,
+			}, ProbeHeight, AgentState.AvoidanceSide)
+			if NewDirection then
+				AvoidanceDirection = NewDirection
+				AgentState.AvoidanceDirection = NewDirection
+				AgentState.AvoidanceSide = Side or AgentState.AvoidanceSide
+				AgentState.AvoidanceUntil = Now + GetParams(Params, "AvoidanceLockSeconds", DEFAULT_AVOIDANCE_LOCK_SECONDS)
+			end
+		end
 
 		if AvoidanceDirection then
 			DesiredVelocityXZ = Horizontal(AvoidanceDirection).Unit * Walkspeed
 		else
+			AgentState.AvoidanceDirection = nil
+			AgentState.AvoidanceUntil = 0
 			local RerouteCooldown = GetParams(Params, "RerouteCooldown", DEFAULT_REROUTE_COOLDOWN)
 			if not AgentState.Path or IsStuck or (Now - AgentState.LastReroute >= RerouteCooldown) then
 				local Path = ComputeLearnedPath(CurrentPosition, Destination, CurrentPosition.Y, RootPart, Clearance, Params)
