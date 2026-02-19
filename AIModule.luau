@@ -495,7 +495,7 @@ local function Horizontal(Vector)
 	return Vector3.new(Vector.X, 0, Vector.Z)
 end
 
-function AIModule.moveAI(AI, Destination, Walkspeed, Params)
+function AIModule.moveAI(Destination, Walkspeed, AI, Params)
 	FlushDataStore(false)
 
 	local RootPart = GetRootPart(AI)
@@ -533,7 +533,7 @@ function AIModule.moveAI(AI, Destination, Walkspeed, Params)
 	local ToDestination = Destination - CurrentPosition
 	local HorizontalToDestination = Horizontal(ToDestination)
 	local Distance = HorizontalToDestination.Magnitude
-	if Distance < 1.5 then
+	if Distance < 4 then
 		local ExistingVelocity = RootPart.AssemblyLinearVelocity
 		RootPart.AssemblyLinearVelocity = Vector3.new(0, ExistingVelocity.Y, 0)
 		return true, "Arrived"
